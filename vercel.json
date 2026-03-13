@@ -1,29 +1,8 @@
 {
-  "builds": [
-    {
-      "src": "api/match.py",
-      "use": "@vercel/python",
-      "config": {
-        "maxLambdaSize": "50mb"
-      }
-    },
-    {
-      "src": "static/**",
-      "use": "@vercel/static"
-    },
-    {
-      "src": "index.html",
-      "use": "@vercel/static"
-    }
-  ],
+  "buildCommand": "",
+  "outputDirectory": ".",
   "routes": [
-    { "src": "/api/match", "dest": "/api/match.py", "methods": ["POST"] },
     { "src": "/static/(.*)", "dest": "/static/$1" },
     { "src": "/(.*)", "dest": "/index.html" }
-  ],
-  "functions": {
-    "api/match.py": {
-      "maxDuration": 60
-    }
-  }
+  ]
 }

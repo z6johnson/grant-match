@@ -1,4 +1,6 @@
 document.addEventListener("DOMContentLoaded", () => {
+    const API_BASE = window.GRANT_MATCH_API_URL || "";
+
     const dropZone = document.getElementById("drop-zone");
     const fileInput = document.getElementById("file-input");
     const filePreview = document.getElementById("file-preview");
@@ -103,7 +105,7 @@ document.addEventListener("DOMContentLoaded", () => {
         formData.append("file", selectedFile);
 
         try {
-            const response = await fetch("/api/match", {
+            const response = await fetch(API_BASE + "/api/match", {
                 method: "POST",
                 body: formData
             });
