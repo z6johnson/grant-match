@@ -311,6 +311,15 @@ def match_faculty(requirements, faculty_with_interests):
     return enriched
 
 
+def _has_research_profile(faculty):
+    """Check if a faculty member has enough data to be matched."""
+    return bool(
+        faculty.get("research_interests")
+        or faculty.get("research_interests_enriched")
+        or faculty.get("expertise_keywords")
+    )
+
+
 def process_grant(grant_text, faculty_data):
     """Coordinate the full grant matching pipeline.
 
@@ -324,10 +333,10 @@ def process_grant(grant_text, faculty_data):
     requirements = extract_grant_requirements(grant_text)
 
     faculty_with_interests = [
-        f for f in faculty_data if f.get("research_interests")
+        f for f in faculty_data if _has_research_profile(f)
     ]
     faculty_without = [
-        f for f in faculty_data if not f.get("research_interests")
+        f for f in faculty_data if not _has_research_profile(f)
     ]
 
     matches = match_faculty(requirements, faculty_with_interests)
