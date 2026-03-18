@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from .normalizer import normalize_faculty_data
@@ -135,7 +137,19 @@ def _make_log_entry(faculty_index, source_name, field, old_value, new_value,
     }
 
 
-def enrich_faculty(faculty_index, sources=None, dry_run=False, department=None):
+def _fetch_source(source_name, registry, faculty_dict, name):
+    """Fetch data from a single source. Designed to run in a thread."""
+    source = registry[source_name]()
+    try:
+        result = source.fetch(faculty_dict)
+    except Exception:
+        logger.exception("Source %s failed for %s", source_name, name)
+        result = None
+    return source_name, result
+
+
+def enrich_faculty(faculty_index, sources=None, dry_run=False, department=None,
+                   _data=None):
     """Enrich a single faculty member from specified sources.
 
     Args:
@@ -143,51 +157,55 @@ def enrich_faculty(faculty_index, sources=None, dry_run=False, department=None):
         sources: List of source names to use, or None for all.
         dry_run: If True, fetch data but don't write.
         department: Department key ("sio" for Scripps, None for HWSPH).
+        _data: Pre-loaded faculty data dict (used by enrich_all to avoid
+               repeated file I/O). When provided, the caller is responsible
+               for saving.
 
     Returns:
         Dict summarizing what was enriched.
     """
     registry = _source_classes_for(department)
-    data = _load_faculty(department)
+    caller_owns_data = _data is not None
+    data = _data if caller_owns_data else _load_faculty(department)
     faculty_list = data["faculty"]
 
     if faculty_index < 0 or faculty_index >= len(faculty_list):
         logger.error("Faculty index %d out of range (0-%d).", faculty_index, len(faculty_list) - 1)
-        return {"error": f"Faculty index {faculty_index} out of range"}
+        return {"error": f"Faculty index {faculty_index} out of range"}, []
 
     faculty_dict = faculty_list[faculty_index]
     name = f"{faculty_dict.get('first_name', '')} {faculty_dict.get('last_name', '')}"
     logger.info("Enriching: %s (index: %d, dept: %s)", name, faculty_index, department or "hwsph")
 
     source_names = sources or list(registry.keys())
+    valid_sources = [s for s in source_names if s in registry]
+    for s in source_names:
+        if s not in registry:
+            logger.warning("Unknown source for dept %s: %s", department or "hwsph", s)
+
     raw_data = {}
     summary = {"faculty_index": faculty_index, "name": name, "sources": {}}
 
-    # Phase 1: Fetch from all sources
-    for source_name in source_names:
-        if source_name not in registry:
-            logger.warning("Unknown source for dept %s: %s", department or "hwsph", source_name)
-            continue
-
-        source = registry[source_name]()
-        try:
-            result = source.fetch(faculty_dict)
-        except Exception:
-            logger.exception("Source %s failed for %s", source_name, name)
-            result = None
-
-        if result:
-            raw_data[source_name] = result
-            summary["sources"][source_name] = {
-                "status": "data_found",
-                "fields": [k for k in result if not k.startswith("_")],
-            }
-        else:
-            summary["sources"][source_name] = {"status": "no_data"}
+    # Phase 1: Fetch from all sources concurrently
+    with ThreadPoolExecutor(max_workers=len(valid_sources)) as executor:
+        futures = {
+            executor.submit(_fetch_source, sn, registry, faculty_dict, name): sn
+            for sn in valid_sources
+        }
+        for future in as_completed(futures):
+            source_name, result = future.result()
+            if result:
+                raw_data[source_name] = result
+                summary["sources"][source_name] = {
+                    "status": "data_found",
+                    "fields": [k for k in result if not k.startswith("_")],
+                }
+            else:
+                summary["sources"][source_name] = {"status": "no_data"}
 
     if not raw_data:
         logger.info("No enrichment data found for %s", name)
-        return summary
+        return summary, []
 
     if dry_run:
         summary["dry_run"] = True
@@ -195,7 +213,7 @@ def enrich_faculty(faculty_index, sources=None, dry_run=False, department=None):
             k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
             for k, v in raw_data.items()
         }
-        return summary
+        return summary, []
 
     # Phase 2: Write direct fields
     log_entries = []
@@ -251,16 +269,20 @@ def enrich_faculty(faculty_index, sources=None, dry_run=False, department=None):
     # Mark when this faculty was last enriched
     faculty_dict["last_enriched"] = datetime.now(timezone.utc).isoformat()
 
-    # Save everything
-    _save_faculty(data, department)
-    for entry in log_entries:
-        _append_log(entry)
+    # If caller doesn't own data, save here (single-faculty mode)
+    if not caller_owns_data:
+        _save_faculty(data, department)
+        for entry in log_entries:
+            _append_log(entry)
+        log_entries = []
 
     logger.info("Enrichment complete for %s", name)
-    return summary
+    return summary, log_entries
 
 
-def enrich_all(sources=None, faculty_ids=None, dry_run=False, progress_callback=None, department=None):
+def enrich_all(sources=None, faculty_ids=None, dry_run=False,
+               progress_callback=None, department=None,
+               time_budget_seconds=None):
     """Enrich all (or specified) faculty members.
 
     Args:
@@ -269,6 +291,9 @@ def enrich_all(sources=None, faculty_ids=None, dry_run=False, progress_callback=
         dry_run: If True, fetch but don't write.
         progress_callback: Optional callable(completed, total) for progress tracking.
         department: Department key ("sio" for Scripps, None for HWSPH).
+        time_budget_seconds: Maximum wall-clock seconds for the run. When
+            approaching this limit the pipeline saves partial results and
+            stops gracefully.  None means no limit.
 
     Returns:
         List of per-faculty summary dicts.
@@ -284,25 +309,67 @@ def enrich_all(sources=None, faculty_ids=None, dry_run=False, progress_callback=
     logger.info("Starting enrichment for %d faculty members (dept: %s).",
                 len(indices), department or "hwsph")
     results = []
+    all_log_entries = []
+    start_time = time.monotonic()
+
+    # Save interval: persist to disk every N faculty to avoid losing work
+    SAVE_INTERVAL = 10
 
     for i, idx in enumerate(indices):
+        # Check time budget before starting next faculty
+        if time_budget_seconds is not None:
+            elapsed = time.monotonic() - start_time
+            remaining = time_budget_seconds - elapsed
+            if remaining < 60:  # less than 60s left — stop gracefully
+                logger.warning(
+                    "Time budget nearly exhausted (%.0fs elapsed, %.0fs remaining). "
+                    "Stopping after %d/%d faculty.",
+                    elapsed, remaining, i, len(indices),
+                )
+                break
+
         try:
-            result = enrich_faculty(idx, sources=sources, dry_run=dry_run, department=department)
+            result, log_entries = enrich_faculty(
+                idx, sources=sources, dry_run=dry_run,
+                department=department, _data=data,
+            )
         except Exception:
             name = faculty_list[idx].get("last_name", str(idx))
             logger.exception("Unhandled error enriching faculty %s (index %d)", name, idx)
-            result = {"faculty_index": idx, "name": name, "error": f"Unhandled exception"}
+            result = {"faculty_index": idx, "name": name, "error": "Unhandled exception"}
+            log_entries = []
+
         results.append(result)
+        all_log_entries.extend(log_entries)
+
         if progress_callback:
             progress_callback(i + 1, len(indices))
+
+        # Periodic save to avoid losing work on crash/timeout
+        if not dry_run and (i + 1) % SAVE_INTERVAL == 0 and all_log_entries:
+            _save_faculty(data, department)
+            for entry in all_log_entries:
+                _append_log(entry)
+            all_log_entries = []
+            logger.info("Checkpoint: saved after %d/%d faculty.", i + 1, len(indices))
+
+    # Final save
+    if not dry_run and all_log_entries:
+        _save_faculty(data, department)
+        for entry in all_log_entries:
+            _append_log(entry)
+    elif not dry_run and results:
+        # Even if no new log entries in last batch, save faculty data
+        _save_faculty(data, department)
 
     enriched_count = sum(
         1 for r in results
         if any(s.get("status") == "data_found" for s in r.get("sources", {}).values())
     )
+    elapsed = time.monotonic() - start_time
     logger.info(
-        "Enrichment complete. %d/%d faculty had data found.",
-        enriched_count, len(results),
+        "Enrichment complete. %d/%d faculty had data found (%.0fs elapsed).",
+        enriched_count, len(results), elapsed,
     )
 
     return results
