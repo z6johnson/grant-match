@@ -23,6 +23,24 @@ class ScrippsProfileSource(BaseSource):
     CATALOG_URL = "https://catalog.ucsd.edu/faculty/SIO.html"
     SCRIPPS_PEOPLE_URL = "https://scripps.ucsd.edu/people"
 
+    # Generic/shared emails that should never be assigned to individual faculty
+    BLOCKED_EMAILS = frozenset({
+        "ctri-support@ucsd.edu",
+        "support@ucsd.edu",
+        "info@ucsd.edu",
+        "webmaster@ucsd.edu",
+        "jacobsschool@ucsd.edu",
+        "hwsph-grants@ucsd.edu",
+        "admissions@ucsd.edu",
+        "registrar@ucsd.edu",
+    })
+
+    _GENERIC_PREFIXES = frozenset({
+        "info", "support", "admin", "admissions", "help", "contact",
+        "office", "dept", "department", "registrar", "webmaster",
+        "grants", "ctri-support", "communications", "events",
+    })
+
     def fields_provided(self):
         return ["research_interests_enriched", "profile_url", "email"]
 
@@ -133,10 +151,14 @@ class ScrippsProfileSource(BaseSource):
             return data
         return None
 
-    @staticmethod
-    def _extract_email_from_page(soup):
-        """Extract a ucsd.edu email address from a profile page."""
-        import re
+    @classmethod
+    def _extract_email_from_page(cls, soup):
+        """Extract a ucsd.edu email address from a profile page.
+
+        Skips generic/shared addresses (e.g. ctri-support@ucsd.edu) that
+        appear on many Scripps pages as a fallback contact.
+        """
+        candidates = []
 
         # Strategy 1: mailto: links
         for link in soup.find_all("a", href=True):
@@ -144,16 +166,28 @@ class ScrippsProfileSource(BaseSource):
             if href.startswith("mailto:"):
                 addr = href.replace("mailto:", "").split("?")[0].strip().lower()
                 if addr and "ucsd.edu" in addr:
-                    return addr
+                    candidates.append(addr)
 
         # Strategy 2: Regex scan for ucsd.edu addresses
         email_pattern = re.compile(
             r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]*ucsd\.edu",
         )
         full_text = soup.get_text()
-        match = email_pattern.search(full_text)
-        if match:
-            return match.group(0).lower()
+        for match in email_pattern.finditer(full_text):
+            addr = match.group(0).lower()
+            if addr not in candidates:
+                candidates.append(addr)
+
+        # Return the first non-blocked candidate
+        for addr in candidates:
+            if addr in cls.BLOCKED_EMAILS:
+                logger.debug("Skipping blocked email: %s", addr)
+                continue
+            local = addr.split("@")[0]
+            if local in cls._GENERIC_PREFIXES:
+                logger.debug("Skipping generic-prefix email: %s", addr)
+                continue
+            return addr
 
         return None
 
