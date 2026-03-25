@@ -1,6 +1,8 @@
 document.addEventListener("DOMContentLoaded", () => {
     const API_BASE = window.RESEARCH_ALIGNMENT_API_URL || "";
 
+    const DEPT_ABBREV = { hwsph: "HWSPH", sio: "SIO", jacobs: "JSOE" };
+
     // --- Element references ---
     // Tabs
     const tabBtns = document.querySelectorAll(".tab-btn");
@@ -351,7 +353,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function buildExpertCard(f) {
         const degrees = (f.degrees || []).join(", ");
         const nameStr = `${f.first_name} ${f.last_name}${degrees ? ", " + degrees : ""}`;
-        const deptBadge = f.department ? `<span class="dept-badge dept-badge-${escapeHtml(f.department)}">${escapeHtml(f.department.toUpperCase())}</span>` : "";
+        const deptBadge = f.department ? `<span class="dept-badge dept-badge-${escapeHtml(f.department)}">${escapeHtml(DEPT_ABBREV[f.department] || f.department.toUpperCase())}</span>` : "";
         const keywords = (f.expertise_keywords || []).slice(0, 8);
         const research = f.research_interests_enriched || f.research_interests || "";
         const diseaseAreas = f.disease_areas || [];
@@ -685,7 +687,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function buildMatchCard(match) {
         const degrees = (match.degrees || []).join(", ");
         const nameStr = `${match.first_name} ${match.last_name}${degrees ? ", " + degrees : ""}`;
-        const matchDeptBadge = match.department ? `<span class="dept-badge dept-badge-${escapeHtml(match.department)}">${escapeHtml(match.department.toUpperCase())}</span>` : "";
+        const matchDeptBadge = match.department ? `<span class="dept-badge dept-badge-${escapeHtml(match.department)}">${escapeHtml(DEPT_ABBREV[match.department] || match.department.toUpperCase())}</span>` : "";
         const score = match.match_score || 0;
         const scoreClass = score >= 80 ? "score-high" : score >= 60 ? "score-med" : "score-low";
 
