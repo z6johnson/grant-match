@@ -44,15 +44,14 @@ class SemanticScholarSource(BaseSource):
         last = faculty_dict.get("last_name", "")
 
         # Prefer ORCID-based lookup — high precision, no disambiguation needed
-        author_id = None
         orcid = faculty_dict.get("orcid")
         if orcid:
-            author_id = self._lookup_by_orcid(orcid)
+            result = self._lookup_by_orcid(orcid)
+            if result:
+                return result
 
         # Fall back to name search
-        if not author_id:
-            author_id = self._search_author(first, last)
-
+        author_id = self._search_author(first, last)
         if not author_id:
             return None
 
@@ -61,7 +60,9 @@ class SemanticScholarSource(BaseSource):
     def _lookup_by_orcid(self, orcid):
         """Look up author by ORCID using Semantic Scholar's external ID support.
 
-        Returns the Semantic Scholar authorId if found, or None.
+        Returns a result dict with h_index, publications, etc., or None.
+        The ORCID endpoint returns the full author profile directly,
+        so we extract data here instead of making a second API call.
         """
         resp = self._get(
             AUTHOR_URL.format(author_id=f"ORCID:{orcid}"),
@@ -70,15 +71,41 @@ class SemanticScholarSource(BaseSource):
             },
         )
         if not resp:
+            logger.info("ORCID %s: no response from Semantic Scholar (status=%s)",
+                        orcid, getattr(resp, 'status_code', 'N/A'))
             return None
+
         try:
             author = resp.json()
         except ValueError:
             return None
+
+        # The ORCID endpoint returns the full profile directly.
+        # Extract authorId for papers lookup and source URL.
         author_id = author.get("authorId")
+        logger.info("ORCID %s resolved to S2 author %s (%s), hIndex=%s",
+                     orcid, author_id, author.get("name"), author.get("hIndex"))
+
+        result = {}
         if author_id:
-            logger.debug("ORCID %s resolved to Semantic Scholar author %s", orcid, author_id)
-        return author_id
+            result["_source_url"] = f"https://www.semanticscholar.org/author/{author_id}"
+
+        # h-index
+        h_index = author.get("hIndex")
+        if h_index is not None:
+            result["h_index"] = h_index
+
+        # Total paper/citation counts for the normalizer
+        result["paper_count"] = author.get("paperCount")
+        result["citation_count"] = author.get("citationCount")
+
+        # Fetch recent papers (requires authorId)
+        if author_id:
+            papers = self._fetch_papers(author_id)
+            if papers:
+                result["recent_publications"] = papers
+
+        return result if len(result) > 1 else None
 
     def _search_author(self, first_name, last_name):
         """Search for an author by name, filtering to UCSD affiliation."""
